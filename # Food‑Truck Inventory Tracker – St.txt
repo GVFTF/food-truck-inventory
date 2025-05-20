@@ -1,0 +1,244 @@
+# Food‑Truck Inventory Tracker – Streamlit App
+# ------------------------------------------------
+# Quick setup instructions (also see README in chat):
+#   1. Ensure your environment has necessary dependencies: streamlit, pandas, openpyxl.
+#   2. Create a new Python Replit project, add this file as **main.py**.
+#   3. Add a **requirements.txt** with:
+#          streamlit==1.33.0
+#          pandas==2.2.2
+#          openpyxl==3.1.2
+#   4. Click "Run". Replit will install dependencies.
+#
+# This script also attempts to auto-install missing packages at runtime.
+# Data is persisted to **inventory.db** via SQLite in the Replit filesystem.
+# ------------------------------------------------
+
+import sys
+import subprocess
+
+# ------ Runtime installer helper ------
+def install_and_import(package_name, import_name=None):
+    """Try import; if missing, pip-install and import."""
+    import_name = import_name or package_name
+    try:
+        return __import__(import_name)
+    except ModuleNotFoundError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
+        return __import__(import_name)
+
+# Auto-install and import core deps
+st = install_and_import("streamlit")
+pd = install_and_import("pandas")
+import sqlite3
+from datetime import date
+
+DB_PATH = "inventory.db"
+
+# ------------------- Database helpers -------------------
+
+def get_conn():
+    """Return a thread-safe SQLite connection."""
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+def init_db():
+    """Initialize database tables and seed default locations."""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS locations (
+                        id INTEGER PRIMARY KEY,
+                        name TEXT UNIQUE NOT NULL
+                    );""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS items (
+                        id INTEGER PRIMARY KEY,
+                        description TEXT NOT NULL,
+                        size_pack TEXT,
+                        UNIQUE(description, size_pack)
+                    );""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS stock (
+                        item_id INTEGER,
+                        location_id INTEGER,
+                        qty REAL DEFAULT 0,
+                        PRIMARY KEY(item_id, location_id),
+                        FOREIGN KEY(item_id) REFERENCES items(id),
+                        FOREIGN KEY(location_id) REFERENCES locations(id)
+                    );""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS waste (
+                        id INTEGER PRIMARY KEY,
+                        waste_date TEXT,
+                        location_id INTEGER,
+                        item_id INTEGER,
+                        qty REAL,
+                        reason TEXT,
+                        FOREIGN KEY(item_id) REFERENCES items(id),
+                        FOREIGN KEY(location_id) REFERENCES locations(id)
+                    );""")
+
+    # Seed default locations
+    default_locs = ["Reefer", "Tent1", "Tent2", "StockTruck"] + [f"Truck{i}" for i in range(1, 9)]
+    for loc in default_locs:
+        cur.execute("INSERT OR IGNORE INTO locations(name) VALUES (?)", (loc,))
+
+    conn.commit()
+    conn.close()
+
+
+def get_locations():
+    conn = get_conn()
+    df = pd.read_sql_query("SELECT * FROM locations", conn, index_col="id")
+    conn.close()
+    return df
+
+
+def get_items():
+    conn = get_conn()
+    df = pd.read_sql_query("SELECT * FROM items", conn, index_col="id")
+    conn.close()
+    return df
+
+
+def upsert_item(description: str, size_pack: str) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO items(description, size_pack) VALUES (?, ?)",
+        (description.strip(), size_pack.strip())
+    )
+    conn.commit()
+    cur.execute(
+        "SELECT id FROM items WHERE description=? AND size_pack=?",
+        (description.strip(), size_pack.strip())
+    )
+    item_id = cur.fetchone()[0]
+    conn.close()
+    return item_id
+
+
+def adjust_stock(item_id: int, location_id: int, delta_qty: float) -> None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO stock(item_id, location_id, qty) VALUES (?,?,0)",
+        (item_id, location_id)
+    )
+    cur.execute(
+        "UPDATE stock SET qty = qty + ? WHERE item_id=? AND location_id=?",
+        (delta_qty, item_id, location_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def log_waste(waste_date: str, location_id: int, item_id: int, qty: float, reason: str) -> None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO waste(waste_date, location_id, item_id, qty, reason) VALUES (?,?,?,?,?)",
+        (waste_date, location_id, item_id, qty, reason.strip())
+    )
+    conn.commit()
+    conn.close()
+
+# ------------------- Streamlit App -------------------
+
+st.set_page_config(page_title="Food‑Truck Inventory", page_icon="🚚", layout="wide")
+init_db()
+loc_df = get_locations()
+loc_options = loc_df["name"].tolist()
+
+st.title("🚚 Food‑Truck Inventory Tracker")
+page = st.sidebar.radio("Navigate", ["Receive Stock", "Move Stock", "Waste Log", "Summary"])
+st.sidebar.write("Data stored in **inventory.db**")
+
+if page == "Receive Stock":
+    st.header("📦 Receive Stock into Storage")
+    with st.form("receive_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        desc = col1.text_input("Item Description")
+        size = col2.text_input("Size / Pack (e.g., 24x355 mL)")
+        loc = st.selectbox("Storage Location", options=loc_options[:4])
+        qty = st.number_input("Quantity Received", min_value=1.0, step=1.0)
+        if st.form_submit_button("Add to Inventory"):
+            item_id = upsert_item(desc, size)
+            loc_id = int(loc_df[loc_df.name==loc].index[0])
+            adjust_stock(item_id, loc_id, qty)
+            st.success(f"Added {qty} x {desc} to {loc}.")
+
+elif page == "Move Stock":
+    st.header("🔄 Move Stock")
+    items_df = get_items()
+    with st.form("move_form", clear_on_submit=True):
+        choice = st.selectbox("Item", items_df.index,
+                              format_func=lambda i: f"{items_df.loc[i,'description']} ({items_df.loc[i,'size_pack']})")
+        frm = st.selectbox("From", loc_options)
+        to = st.selectbox("To", [l for l in loc_options if l!=frm])
+        qty = st.number_input("Quantity to Move", min_value=1.0, step=1.0)
+        if st.form_submit_button("Move Stock"):
+            fid = int(loc_df[loc_df.name==frm].index[0])
+            tid = int(loc_df[loc_df.name==to].index[0])
+            adjust_stock(choice, fid, -qty)
+            adjust_stock(choice, tid, qty)
+            st.success(f"Moved {qty} x item #{choice} from {frm} to {to}.")
+
+elif page == "Waste Log":
+    st.header("🗑️ Record Waste")
+    items_df = get_items()
+    with st.form("waste_form", clear_on_submit=True):
+        wdate = st.date_input("Date", value=date.today())
+        wloc = st.selectbox("Location", loc_options)
+        choice = st.selectbox("Item", items_df.index,
+                              format_func=lambda i: f"{items_df.loc[i,'description']} ({items_df.loc[i,'size_pack']})")
+        qty = st.number_input("Quantity Wasted", min_value=1.0, step=1.0)
+        reason = st.text_input("Reason (optional)")
+        if st.form_submit_button("Log Waste"):
+            lid = int(loc_df[loc_df.name==wloc].index[0])
+            log_waste(str(wdate), lid, choice, qty, reason)
+            adjust_stock(choice, lid, -qty)
+            st.success(f"Logged {qty} waste for item #{choice} at {wloc}.")
+
+else:
+    st.header("📊 Inventory Summary")
+    conn = get_conn()
+    df = pd.read_sql_query(
+        """
+        SELECT i.description, i.size_pack, l.name AS location,
+               COALESCE(s.qty,0) AS qty
+        FROM items i
+        CROSS JOIN locations l
+        LEFT JOIN stock s ON s.item_id=i.id AND s.location_id=l.id
+        ORDER BY i.description, l.name;
+        """, conn)
+    conn.close()
+    pivot = df.pivot(index=["description","size_pack"], columns="location", values="qty").fillna(0)
+
+    conn = get_conn()
+    waste_df = pd.read_sql_query(
+        """
+        SELECT i.description, i.size_pack, SUM(w.qty) AS waste_qty
+        FROM waste w
+        JOIN items i ON i.id=w.item_id
+        GROUP BY i.description, i.size_pack;
+        """, conn)
+    conn.close()
+    pivot["Waste Qty"] = waste_df.set_index(["description","size_pack"]).get("waste_qty",0)
+    pivot["Total On Hand"] = pivot.sum(axis=1) - pivot["Waste Qty"]
+
+    st.dataframe(pivot, use_container_width=True)
+    with pd.ExcelWriter("summary.xlsx", engine="openpyxl") as writer:
+        pivot.to_excel(writer, sheet_name="Summary")
+    with open("summary.xlsx","rb") as f:
+        st.download_button("Download Excel Summary", f, file_name="inventory_summary.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ---------- Basic self-test ----------
+if __name__ == "__main__":
+    init_db()
+    print("DB initialized.")
+    locs = get_locations()
+    assert "Reefer" in locs["name"].values, "Reefer missing"
+    iid = upsert_item("TestItem","1 pack")
+    adjust_stock(iid, locs[locs["name"]=="Reefer"].index[0], 5)
+    df = pd.read_sql_query("SELECT qty FROM stock WHERE item_id=?", get_conn(), params=(iid,))
+    assert df["qty"].iloc[0]==5, "Stock adjust failed"
+    print("All tests passed.")
